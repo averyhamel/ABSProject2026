@@ -1,0 +1,307 @@
+---
+title: "ABS Final Project"
+author: "Avery Hamel"
+date: "2026-10-14"
+output: html_document
+runtime: shiny
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(baseballr)
+library(tidyverse)
+library(Lahman)
+library(ggplot2)
+```
+
+
+```{r}
+# all challenges
+challenges_df <- read_csv("taptochallenge_challenges_2026_R.csv") %>%
+  mutate(
+    challenge_category = case_when(
+      Role == "batter" & Result == TRUE ~ "Successful Batter Challenge",
+      Role == "batter" & Result == FALSE ~ "Unsuccessful Batter Challenge",
+      Role %in% c("catcher", "pitcher") & Result == TRUE ~ "Successful Pitcher/Catcher Challenge",
+      Role %in% c("catcher", "pitcher") & Result == FALSE ~ "Unsuccessful Pitcher/Catcher Challenge",
+      TRUE ~ "Other"
+    ),
+    category_type = "Executed Challenge",
+    # Clean player name format to match Statcast "Last, First" -> "First Last" or vice versa
+    player_name_clean = str_trim(Player)
+  )
+
+# missed opportunities
+missed_df <- read_csv("taptochallenge_missed_2026_R.csv") %>%
+  mutate(
+    challenge_category = case_when(
+      Role == "Batter" ~ "Missed Opportunity - Batter",
+      Role == "Pitcher/Catcher" ~ "Missed Opportunity - Pitcher/Catcher",
+      TRUE ~ "Missed Opportunity - Other"
+    ),
+    category_type = "Missed Opportunity",
+    player_name_clean = str_trim(Player)
+  )
+
+# missed opportunities out of challenges
+out_of_challenges_df <- read_csv("taptochallenge_out_of_challenges_2026_R.csv") %>%
+  mutate(
+    challenge_category = case_when(
+      Role == "Batter" ~ "Out of Challenges - Batter",
+      Role == "Pitcher/Catcher" ~ "Out of Challenges - Pitcher/Catcher",
+      TRUE ~ "Out of Challenges - Other"
+    ),
+    category_type = "Out of Challenges",
+    player_name_clean = str_trim(Player)
+  )
+
+# combine?
+master_strategy_df <- bind_rows(challenges_df, missed_df, out_of_challenges_df)
+```
+
+```{r}
+# RE24/run expectancy summary table
+master_strategy_summary <- master_strategy_df %>%
+  group_by(category_type, challenge_category) %>%
+  summarize(
+    total_events = n(),
+    mean_potential_re_delta = mean(`Potential Run Expectancy delta if overturned`, na.rm = TRUE),
+    mean_net_wpa = if("Net WPA" %in% names(.)) mean(`Net WPA`, na.rm = TRUE) else NA,
+    .groups = "drop"
+  )
+```
+
+```{r}
+# regression model
+model1 <- lm(`Potential Run Expectancy delta if overturned` ~ category_type + `Call LI`, data = master_strategy_df)
+summary(model1)
+```
+
+```{r}
+model2 <- glm(Result ~ `Dist (in.)` + `xStr%` + `Call LI`,
+              data = master_strategy_df %>% filter(!is.na(Result)),
+              family = binomial(link = "logit"))
+summary(model2)
+```
+
+```{r}
+set.seed(1234)
+n_sims <- 1000
+
+sim_strategy_re <- function(df, sims = n_sims) {
+  df %>%
+    filter(!is.na(`Potential Run Expectancy delta if overturned`)) %>%
+    slice(rep(1:n(), each = sims)) %>%
+    mutate(
+      sim_re_change = rnorm(n(), mean = `Potential Run Expectancy delta if overturned`, sd = 0.05),
+      sim_re_change = pmax(sim_re_change, 0)
+    )
+}
+
+sim_strategy_results <- sim_strategy_re(master_strategy_df)
+```
+
+```{r}
+# viz 1: density plot for sim
+mc_plot <- ggplot(sim_strategy_results, aes(x = sim_re_change, fill = category_type)) +
+  geom_density(alpha = 0.5, color = "navy", linewidth = 0.4) +
+  theme_bw(base_size = 14) +
+  labs(title = "Monte Carlo Sim: Potential Run Expectancy change by stratefy state",
+       subtitle = "Simulated variance across 1000 iterations",
+       x = "Simulated potential RE Change", y = "Density",
+       fill = "Strategy state") +
+  scale_fill_brewer(palette = "Set2")
+```
+
+```{r}
+install.packages("rsconnect")
+library(rsconnect)
+library(shiny)
+
+# app ui
+ui <- fluidPage(
+  titlePanel("ABS Challenge Strategy & RE24 Impact Dashboard"),
+  
+  sidebarLayout(
+    sidebarPanel(
+      selectInput("selected_team", "Select Team:",
+                  choices = c("All Teams" = "ALL", sort(unique(master_strategy_df$Team[!is.na(master_strategy_df$Team)])))),
+      
+      # 2. Player-level filter (dynamically updates based on selected team)
+      uiOutput("player_select_ui"),
+      
+      # 3. Metric selector
+      selectInput("metric_choice", "Select Strategic Metric:",
+                  choices = c("Potential Run Expectancy Delta" = "Potential Run Expectancy delta if overturned", 
+                              "Leverage Index (Call LI)" = "Call LI", 
+                              "Distance from Zone (in.)" = "Dist (in.)")),
+      
+      helpText("Filter by team and individual player to examine run expectancy swings and decision states.")
+    ),
+    
+    mainPanel(
+      tabsetPanel(
+        tabPanel("Strategy comparison panel",
+                 plotOutput("team_plot"),
+                 tags$hr(),
+                 p("Comparing Run Expectancy values and leverage across executed challenges, missed opportunities, and out of challenge states.")),
+        
+        tabPanel("Monte Carlo Simulation",
+                 plotOutput("sim_tab_plot"),
+                 tags$hr(),
+                 p("Distribution of simulated Run Expectancy swings.")),
+        
+        tabPanel("Strategy data table",
+                 tableOutput("team_table"))
+      )
+    )
+  )
+)
+
+# --- SHINY APP SERVER ---
+server <- function(input, output, session) {
+  
+  # Dynamic UI for player selection based on selected team
+  output$player_select_ui <- renderUI({
+    df <- master_strategy_df
+    if (!is.null(input$selected_team) && input$selected_team != "ALL") {
+      df <- df %>% filter(Team == input$selected_team)
+    }
+    player_choices <- c("All Players" = "ALL", sort(unique(df$Player[!is.na(df$Player)])))
+    
+    selectInput("selected_player", "Select player:", choices = player_choices, selected = "ALL")
+  })
+  
+  # Reactive dataset filtered by both team and player selections
+  filtered_data <- reactive({
+    df <- master_strategy_df
+    
+    if(!is.null(input$selected_team) && input$selected_team != "ALL") {
+      df <- df %>% filter(Team == input$selected_team)
+    }
+    
+    if(!is.null(input$selected_player) && input$selected_player != "ALL") {
+      df <- df %>% filter(Player == input$selected_player)
+    }
+    
+    df
+  })
+  
+  # IMPROVED VISUALIZATION: Violin Plot with Mean Points and Boxplots
+  output$team_plot <- renderPlot({
+    df <- filtered_data()
+    if (nrow(df) == 0) return(NULL)
+    metric_sym <- sym(input$metric_choice)
+    
+    title_text <- if (!is.null(input$selected_player) && input$selected_player != "ALL") {
+      paste("Strategic Breakdown for", input$selected_player)
+    } else if (!is.null(input$selected_team) && input$selected_team != "ALL") {
+      paste("Strategic Breakdown for Team:", input$selected_team)
+    } else {
+      "Strategic Breakdown: League-Wide"
+    }
+    
+    ggplot(df, aes(x = category_type, y = !!metric_sym, fill = category_type)) +
+      geom_violin(alpha = 0.6, trim = FALSE, scale = "width") +
+      geom_boxplot(width = 0.15, color = "black", alpha = 0.8, outlier.shape = NA) +
+      stat_summary(fun = mean, geom = "point", shape = 21, size = 3, fill = "white", color = "black") +
+      theme_minimal(base_size = 14) +
+      labs(title = title_text,
+           subtitle = paste("Distribution of", input$metric_choice, "(White dot = Mean)"),
+           x = "Strategic Decision State", y = input$metric_choice) +
+      theme(axis.text.x = element_text(angle = 15, hjust = 1, face = "bold"),
+            legend.position = "none") +
+      scale_fill_brewer(palette = "Pastel2")
+  })
+  
+  # Monte Carlo Simulation Plot
+  output$sim_tab_plot <- renderPlot({
+    df <- filtered_data()
+    if (nrow(df) == 0) return(NULL)
+    
+    set.seed(1234)
+    sim_df <- df %>%
+      filter(!is.na(`Potential Run Expectancy delta if overturned`)) %>%
+      slice(rep(1:n(), each = 50)) %>%
+      mutate(
+        sim_re = rnorm(n(), mean = `Potential Run Expectancy delta if overturned`, sd = 0.04)
+      )
+    
+    ggplot(sim_df, aes(x = sim_re, fill = category_type)) +
+      geom_density(alpha = 0.5) +
+      theme_bw(base_size = 14) +
+      labs(title = "Monte Carlo simulation spread",
+           subtitle = "Simulated Run Expectancy change distribution",
+           x = "Simulated potential RE change", y = "Density",
+           fill = "Strategy state") +
+      scale_fill_brewer(palette = "Set2")
+  })
+  
+# summary table
+  output$team_table <- renderTable({
+    df <- filtered_data()
+    if (nrow(df) == 0) return(NULL)
+    
+    if (!is.null(input$selected_player) && input$selected_player != "ALL") {
+      # player-level table
+      df %>%
+        group_by(Player, category_type, challenge_category) %>%
+        summarize(
+          Total_Events = n(),
+          Mean_RE_Delta = mean(`Potential Run Expectancy delta if overturned`, na.rm = TRUE),
+          Mean_Leverage = mean(`Call LI`, na.rm = TRUE),
+          .groups = "drop"
+        ) %>%
+        filter(Total_Events >= 3) %>%
+        arrange(desc(Mean_Leverage))
+      
+    } else if (!is.null(input$selected_team) && input$selected_team != "ALL") {
+      # team-roster table
+      df %>%
+        group_by(Player, category_type) %>%
+        summarize(
+          Total_Events = n(),
+          Mean_RE_Delta = mean(`Potential Run Expectancy delta if overturned`, na.rm = TRUE),
+          Mean_Leverage = mean(`Call LI`, na.rm = TRUE),
+          .groups = "drop"
+        ) %>%
+        group_by(Player) %>%
+        mutate(Player_Total_Events = sum(Total_Events)) %>%
+        ungroup() %>%
+        filter(Player_Total_Events > 3) %>%
+        select(-Player_Total_Events) %>%
+        pivot_wider(
+          names_from = category_type,
+          values_from = c(Total_Events, Mean_RE_Delta),
+          values_fill = 0
+        ) %>%
+        arrange(desc(Mean_Leverage))
+      
+    } else {
+      # LEAGUE-WIDE TEAM LEADERBOARD SUMMARY TABLE (Filtered for teams with > 3 total events)
+      df %>%
+        group_by(Team, category_type) %>%
+        summarize(
+          Total_Events = n(),
+          Mean_RE_Delta = mean(`Potential Run Expectancy delta if overturned`, na.rm = TRUE),
+          Mean_Leverage = mean(`Call LI`, na.rm = TRUE),
+          .groups = "drop"
+        ) %>%
+        group_by(Team) %>%
+        mutate(Team_Total_Events = sum(Total_Events)) %>%
+        ungroup() %>%
+        filter(Team_Total_Events > 3) %>%
+        select(-Team_Total_Events) %>%
+        pivot_wider(
+          names_from = category_type,
+          values_from = c(Total_Events, Mean_RE_Delta),
+          values_fill = 0
+        ) %>%
+        arrange(desc(Mean_Leverage))
+    }
+  }, striped = TRUE, hover = TRUE, bordered = TRUE)
+}
+
+shinyApp(ui = ui, server = server)
+```
+
